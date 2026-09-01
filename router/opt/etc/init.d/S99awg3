@@ -291,11 +291,11 @@ prepare_parsed()
 # ---------------------------------------------------------
 #
 
-cleanup_old_linux()
+cleanup_old_state()
 {
     [ -f "$STATE_FILE" ] || return 0
 
-    log "removing previously managed AWG interfaces"
+    log "cleaning up previously managed interfaces"
 
     while IFS="$(printf '\t')" read -r source index ndms; do
 
@@ -306,9 +306,19 @@ cleanup_old_linux()
         if linux_iface_exists "$iface"; then
 
             if is_awg_interface "$iface"; then
-                log "deleting $iface"
+                log "deleting Linux device $iface"
 
                 ip link delete "$iface" \
+                    >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # If configuration file was deleted, remove NDMS interface as well
+        if [ ! -f "$source" ]; then
+            if [ -n "$ndms" ] && ndms_exists "$ndms"; then
+                log "removing orphaned NDMS interface $ndms (config deleted: $source)"
+
+                ndmc -c "no interface $ndms" \
                     >/dev/null 2>&1 || true
             fi
         fi
@@ -579,10 +589,10 @@ start()
     fi
 
     #
-    # Remove only Linux AWG devices which were managed
-    # during the previous successful start.
+    # Clean up Linux devices and delete orphaned NDMS interfaces
+    # whose configuration files were removed.
     #
-    cleanup_old_linux
+    cleanup_old_state
 
     #
     # Remove generated files.
