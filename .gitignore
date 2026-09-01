@@ -1,0 +1,25 @@
+.tmp_versions/
+
+# Secrets and personal configs
+*.private.conf
+/router/opt/etc/awg3/conf/*.conf
+!/router/opt/etc/awg3/conf/awg3_example.conf
+*.key
+*.psk
+
+# Runtime state and logs
+/router/opt/etc/awg3/managed.tsv
+/router/opt/etc/awg3/parsed/
+*.log
+*.tmp
+
+# Workspace scratch and temp
+scratch/
+.system_generated/
+user_messages.txt
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

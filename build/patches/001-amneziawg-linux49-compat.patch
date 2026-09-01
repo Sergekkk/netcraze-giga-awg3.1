@@ -1,0 +1,250 @@
+diff --git a/src/compat/Kbuild.include b/src/compat/Kbuild.include
+index 4c12d29..9a1f51f 100644
+--- a/src/compat/Kbuild.include
++++ b/src/compat/Kbuild.include
+@@ -135,3 +135,10 @@ endif
+ ifeq ($(wildcard $(srctree)/include/linux/sprintf.h),)
+ ccflags-y += -I$(kbuild-dir)/compat/sprintf/include
+ endif
++
++# Keenetic/vendor kernels may backport skb_queue_empty_lockless
++ifneq ($(shell grep -s -F "skb_queue_empty_lockless" "$(srctree)/include/linux/skbuff.h"),)
++ccflags-y += -DCOMPAT_HAVE_SKB_QUEUE_EMPTY_LOCKLESS
++endif
++
++ccflags-y += -I$(kbuild-dir)/compat/crypto/blake2s-awg/include
+diff --git a/src/compat/compat.h b/src/compat/compat.h
+index 3b8606d..a2eccba 100644
+--- a/src/compat/compat.h
++++ b/src/compat/compat.h
+@@ -896,10 +896,6 @@ static inline void skb_mark_not_on_list(struct sk_buff *skb)
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 200) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 20, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 249)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 285)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 320))) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) && !defined(ISUBUNTU2004)
+ #define COMPAT_INIT_CRYPTO
+-#define blake2s_init zinc_blake2s_init
+-#define blake2s_init_key zinc_blake2s_init_key
+-#define blake2s_update zinc_blake2s_update
+-#define blake2s_final zinc_blake2s_final
+ #endif
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+ #define blake2s_hmac zinc_blake2s_hmac
+@@ -967,7 +963,7 @@ static inline int skb_ensure_writable(struct sk_buff *skb, int write_len)
+ }
+ #endif
+ 
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)) || (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 102) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 178) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 223) && LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)) || LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 259) || defined(ISRHEL8) || defined(ISUBUNTU1804)
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)) || (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 102) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 178) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 223) && LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)) || LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 259) || defined(ISRHEL8) || defined(ISUBUNTU1804) || LINUX_VERSION_CODE == KERNEL_VERSION(4, 9, 337)
+ #include <linux/icmpv6.h>
+ #include <net/icmp.h>
+ #if IS_ENABLED(CONFIG_NF_NAT)
+@@ -1353,7 +1349,7 @@ static inline void netif_set_tso_max_size(struct net_device *dev, unsigned int s
+ #define __nonstring
+ #endif
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0) && !defined(COMPAT_HAVE_SKB_QUEUE_EMPTY_LOCKLESS)
+ static inline bool skb_queue_empty_lockless(const struct sk_buff_head *list)
+ {
+ 	return READ_ONCE(list->next) == (const struct sk_buff *) list;
+@@ -1399,14 +1395,6 @@ static inline char *nla_strdup(const struct nlattr *nla, gfp_t flags)
+ #define COMPAT_CANNOT_USE_NETLINK_MCGRPS
+ #endif
+ 
+-/* Kernel 6.19+ renamed blake2s_state to blake2s_ctx and changed blake2s() arg order */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
+-#include <crypto/blake2s.h>
+-#define blake2s_ctx blake2s_state
+-#define blake2s(key, keylen, in, inlen, out, outlen) \
+-	blake2s(out, in, key, outlen, inlen, keylen)
+-#endif
+-
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0) && !IS_ENABLED(CONFIG_IPV6)
+ #include <net/ipv6_stubs.h>
+ static inline struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struct sock *sk, struct flowi6 *fl6,
+@@ -1417,30 +1405,66 @@ static inline struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struc
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+ #include <crypto/chacha.h>
+-#define CHACHA_KEY_WORDS	8
+-#ifndef CHACHA_STATE_WORDS
+-#define CHACHA_STATE_WORDS	(CHACHA_BLOCK_SIZE / sizeof(u32))
+-#endif
++#include <linux/string.h>
++
++#define CHACHA_KEY_WORDS 8
++#define CHACHA_STATE_WORDS 16
++#define COMPAT_CHACHA_BLOCK_SIZE 64
++
++#undef CHACHA_IV_SIZE
++#undef CHACHA_KEY_SIZE
++#undef CHACHA20_KEY_SIZE
++#undef CHACHA_BLOCK_SIZE
++#undef CHACHA20_BLOCK_SIZE
++#undef CHACHAPOLY_IV_SIZE
++#undef XCHACHA_IV_SIZE
++
++#define CHACHA_KEY_SIZE 32
++
+ struct chacha_state {
+-	u32 x[CHACHA_STATE_WORDS];
++        u32 x[CHACHA_STATE_WORDS];
+ };
+ 
+ static inline void __compat_chacha_init(struct chacha_state *state,
+-					const u32 *key,
+-					const u8 *iv)
++                                        const u32 *key,
++                                        const u8 *iv)
+ {
+-	(chacha_init)(state->x, key, iv);
++        struct chacha_ctx ctx;
++
++        memcpy(ctx.key, key, sizeof(ctx.key));
++        ctx.nrounds = 20;
++
++        crypto_chacha_init(state->x, &ctx, (u8 *)iv);
+ }
+-#define chacha_init(state, key, iv) __compat_chacha_init((state), (key), (iv))
++
++#define chacha_init(state, key, iv) \
++        __compat_chacha_init((state), (key), (iv))
+ 
+ static inline void __compat_chacha20_crypt(struct chacha_state *state,
+-					       u8 *dst, const u8 *src,
+-					       unsigned int bytes)
++                                           u8 *dst, const u8 *src,
++                                           unsigned int bytes)
+ {
+-	(chacha20_crypt)(state->x, dst, src, bytes);
++        u8 stream[COMPAT_CHACHA_BLOCK_SIZE] __aligned(sizeof(long));
++
++        if (dst != src)
++                memcpy(dst, src, bytes);
++
++        while (bytes >= COMPAT_CHACHA_BLOCK_SIZE) {
++                chacha_block(state->x, stream, 20);
++                crypto_xor(dst, stream, COMPAT_CHACHA_BLOCK_SIZE);
++                bytes -= COMPAT_CHACHA_BLOCK_SIZE;
++                dst += COMPAT_CHACHA_BLOCK_SIZE;
++                src += COMPAT_CHACHA_BLOCK_SIZE;
++        }
++
++        if (bytes) {
++                chacha_block(state->x, stream, 20);
++                crypto_xor(dst, stream, bytes);
++        }
+ }
+-#define chacha20_crypt(s, d, src, b) __compat_chacha20_crypt((s),(d),(src),(b))
++
++#define chacha20_crypt(s, d, src, b) \
++        __compat_chacha20_crypt((s), (d), (src), (b))
+ 
+ #endif
+ 
+diff --git a/src/compat/crypto/blake2s-awg/include/crypto/blake2s-awg.h b/src/compat/crypto/blake2s-awg/include/crypto/blake2s-awg.h
+new file mode 100644
+index 0000000..9d6f34e
+--- /dev/null
++++ b/src/compat/crypto/blake2s-awg/include/crypto/blake2s-awg.h
+@@ -0,0 +1,23 @@
++#ifndef _AWG_COMPAT_BLAKE2S_H
++#define _AWG_COMPAT_BLAKE2S_H
++
++#include <crypto/blake2s.h>
++
++/*
++ * Keenetic 4.9 provides: struct blake2s_state
++ * AmneziaWG source uses: struct blake2s_ctx
++ */
++#define blake2s_ctx blake2s_state
++
++/*
++ * Adapt calling convention to kernel 4.9 blake2s
++ */
++static inline void awg_blake2s(
++	const u8 *key, size_t keylen,
++	const u8 *in, size_t inlen,
++	u8 *out, size_t outlen)
++{
++	blake2s(out, in, key, outlen, inlen, keylen);
++}
++
++#define blake2s(key, keylen, in, inlen, out, outlen) \
++	awg_blake2s((key), (keylen), (in), (inlen), (out), (outlen))
++
++#endif
+diff --git a/src/cookie.c b/src/cookie.c
+index 040f171..a8df5bc 100644
+--- a/src/cookie.c
++++ b/src/cookie.c
+@@ -1,3 +1,4 @@
++#include <crypto/blake2s-awg.h>
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+@@ -33,7 +34,7 @@ static void precompute_key(u8 key[NOISE_SYMMETRIC_KEY_LEN],
+ 			   const u8 pubkey[NOISE_PUBLIC_KEY_LEN],
+ 			   const u8 label[COOKIE_KEY_LABEL_LEN])
+ {
+-	struct blake2s_ctx blake;
++	struct blake2s_state blake;
+ 
+ 	blake2s_init(&blake, NOISE_SYMMETRIC_KEY_LEN);
+ 	blake2s_update(&blake, label, COOKIE_KEY_LABEL_LEN);
+@@ -91,7 +92,7 @@ static void compute_mac2(u8 mac2[COOKIE_LEN], const void *message, size_t len,
+ static void make_cookie(u8 cookie[COOKIE_LEN], struct sk_buff *skb,
+ 			struct cookie_checker *checker)
+ {
+-	struct blake2s_ctx state;
++	struct blake2s_state state;
+ 
+ 	if (wg_birthdate_has_expired(checker->secret_birthdate,
+ 				     COOKIE_SECRET_MAX_AGE)) {
+diff --git a/src/main.c b/src/main.c
+index 3692785..84218c5 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "version.h"
++#include "crypto/zinc.h"
+ #include "device.h"
+ #include "noise.h"
+ #include "queueing.h"
+diff --git a/src/noise.c b/src/noise.c
+index 9fc2dcd..64d54de 100644
+--- a/src/noise.c
++++ b/src/noise.c
+@@ -1,3 +1,4 @@
++#include <crypto/blake2s-awg.h>
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+@@ -35,7 +36,7 @@ static atomic64_t keypair_counter = ATOMIC64_INIT(0);
+ 
+ void __init wg_noise_init(void)
+ {
+-	struct blake2s_ctx blake;
++	struct blake2s_state blake;
+ 
+ 	blake2s(NULL, 0, handshake_name, sizeof(handshake_name),
+ 		handshake_init_chaining_key, NOISE_HASH_LEN);
+@@ -306,7 +307,7 @@ void wg_noise_set_static_identity_private_key(
+ 
+ static void hmac(u8 *out, const u8 *in, const u8 *key, const size_t inlen, const size_t keylen)
+ {
+-	struct blake2s_ctx state;
++	struct blake2s_state state;
+ 	u8 x_key[BLAKE2S_BLOCK_SIZE] __aligned(__alignof__(u32)) = { 0 };
+ 	u8 i_hash[BLAKE2S_HASH_SIZE] __aligned(__alignof__(u32));
+ 	int i;
+@@ -433,7 +434,7 @@ static bool __must_check mix_precomputed_dh(u8 chaining_key[NOISE_HASH_LEN],
+ 
+ static void mix_hash(u8 hash[NOISE_HASH_LEN], const u8 *src, size_t src_len)
+ {
+-	struct blake2s_ctx blake;
++	struct blake2s_state blake;
+ 
+ 	blake2s_init(&blake, NOISE_HASH_LEN);
+ 	blake2s_update(&blake, hash, NOISE_HASH_LEN);

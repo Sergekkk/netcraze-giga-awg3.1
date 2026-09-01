@@ -1,0 +1,800 @@
+#!/bin/sh
+
+PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+MODULE="/opt/lib/modules/amneziawg.ko"
+AWG="/opt/bin/awg"
+SPLITTER="/opt/bin/awg3-split-config"
+
+CONF_DIR="/opt/etc/awg3/conf"
+PARSED_DIR="$CONF_DIR/parsed"
+
+STATE_DIR="/opt/etc/awg3"
+STATE_FILE="$STATE_DIR/managed.tsv"
+
+IFACE_PREFIX="opkgtun"
+NDMS_PREFIX="OpkgTun"
+
+MAX_INDEX=99
+
+
+log()
+{
+    echo "[awg3] $*"
+}
+
+
+#
+# ---------------------------------------------------------
+# Basic checks
+# ---------------------------------------------------------
+#
+
+command_exists()
+{
+    command -v "$1" >/dev/null 2>&1
+}
+
+
+check_requirements()
+{
+    if [ ! -f "$MODULE" ]; then
+        log "ERROR: kernel module not found: $MODULE"
+        return 1
+    fi
+
+    if [ ! -x "$AWG" ]; then
+        log "ERROR: awg not found or not executable: $AWG"
+        return 1
+    fi
+
+    if [ ! -x "$SPLITTER" ]; then
+        log "ERROR: splitter not found or not executable: $SPLITTER"
+        return 1
+    fi
+
+    if ! command_exists ip; then
+        log "ERROR: ip command not found"
+        return 1
+    fi
+
+    if ! command_exists ndmc; then
+        log "ERROR: ndmc command not found"
+        return 1
+    fi
+
+    return 0
+}
+
+
+#
+# ---------------------------------------------------------
+# Linux interface helpers
+# ---------------------------------------------------------
+#
+
+linux_iface_exists()
+{
+    iface="$1"
+
+    ip link show "$iface" >/dev/null 2>&1
+}
+
+
+is_awg_interface()
+{
+    iface="$1"
+
+    [ -f "/sys/class/net/$iface/uevent" ] || return 1
+
+    grep -q '^DEVTYPE=amneziawg$' \
+        "/sys/class/net/$iface/uevent"
+}
+
+
+#
+# ---------------------------------------------------------
+# NDMS helpers
+# ---------------------------------------------------------
+#
+
+ndms_exists()
+{
+    ndms="$1"
+
+    ndmc -c "show interface $ndms" >/dev/null 2>&1
+}
+
+
+ndms_is_opkgtun()
+{
+    ndms="$1"
+
+    ndmc -c "show interface $ndms" 2>/dev/null |
+        grep -q '^[[:space:]]*type: OpkgTun$'
+}
+
+
+ndms_create()
+{
+    ndms="$1"
+
+    if ndms_exists "$ndms"; then
+        if ndms_is_opkgtun "$ndms"; then
+            log "$ndms already exists"
+            return 0
+        fi
+
+        log "ERROR: $ndms exists but is not OpkgTun"
+        return 1
+    fi
+
+    log "creating NDMS interface $ndms"
+
+    if ! ndmc -c "interface $ndms" >/dev/null 2>&1; then
+        log "ERROR: unable to create $ndms"
+        return 1
+    fi
+
+    if ! ndms_is_opkgtun "$ndms"; then
+        log "ERROR: created $ndms but type is not OpkgTun"
+        return 1
+    fi
+
+    return 0
+}
+
+
+ndms_description()
+{
+    ndms="$1"
+    description="$2"
+
+    ndmc -c "interface $ndms description $description" \
+        >/dev/null 2>&1
+}
+
+
+ndms_apply_config()
+{
+    script="$1"
+
+    sh "$script"
+}
+
+
+#
+# ---------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------
+#
+
+state_get_index()
+{
+    source="$1"
+
+    [ -f "$STATE_FILE" ] || return 1
+
+    awk -F '	' -v src="$source" '
+        $1 == src {
+            print $2
+            exit
+        }
+    ' "$STATE_FILE"
+}
+
+
+state_index_owned_by()
+{
+    index="$1"
+
+    [ -f "$STATE_FILE" ] || return 1
+
+    awk -F '	' -v idx="$index" '
+        $2 == idx {
+            print $1
+            exit
+        }
+    ' "$STATE_FILE"
+}
+
+
+#
+# Is this index still reserved by a configuration
+# which currently exists?
+#
+state_index_used_by_current_config()
+{
+    index="$1"
+
+    owner="$(state_index_owned_by "$index" 2>/dev/null || true)"
+
+    [ -n "$owner" ] || return 1
+
+    [ -f "$owner" ]
+}
+
+
+#
+# Check whether index is already assigned in NEW_STATE.
+#
+new_state_has_index()
+{
+    index="$1"
+    new_state="$2"
+
+    [ -f "$new_state" ] || return 1
+
+    awk -F '	' -v idx="$index" '
+        $2 == idx {
+            found=1
+            exit
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' "$new_state"
+}
+
+
+#
+# Find the first index which is not used by:
+#
+#   1. current NEW_STATE
+#   2. an old state entry whose source still exists
+#
+find_free_index()
+{
+    new_state="$1"
+
+    index=0
+
+    while [ "$index" -le "$MAX_INDEX" ]; do
+
+        if new_state_has_index "$index" "$new_state"; then
+            index=$((index + 1))
+            continue
+        fi
+
+        if state_index_used_by_current_config "$index"; then
+            index=$((index + 1))
+            continue
+        fi
+
+        echo "$index"
+        return 0
+    done
+
+    return 1
+}
+
+
+#
+# ---------------------------------------------------------
+# Parsed files
+# ---------------------------------------------------------
+#
+
+prepare_parsed()
+{
+    mkdir -p "$PARSED_DIR"
+
+    rm -f \
+        "$PARSED_DIR"/opkgtun*.awg.conf \
+        "$PARSED_DIR"/opkgtun*.ndms.sh
+}
+
+
+#
+# ---------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------
+#
+
+cleanup_old_linux()
+{
+    [ -f "$STATE_FILE" ] || return 0
+
+    log "removing previously managed AWG interfaces"
+
+    while IFS="$(printf '\t')" read -r source index ndms; do
+
+        [ -n "$index" ] || continue
+
+        iface="${IFACE_PREFIX}${index}"
+
+        if linux_iface_exists "$iface"; then
+
+            if is_awg_interface "$iface"; then
+                log "deleting $iface"
+
+                ip link delete "$iface" \
+                    >/dev/null 2>&1 || true
+            fi
+        fi
+
+    done < "$STATE_FILE"
+}
+
+
+#
+# ---------------------------------------------------------
+# AWG device
+# ---------------------------------------------------------
+#
+
+ensure_awg_device()
+{
+    iface="$1"
+
+    if linux_iface_exists "$iface"; then
+
+        if is_awg_interface "$iface"; then
+            log "$iface is already AmneziaWG"
+            return 0
+        fi
+
+        log "$iface exists but is not AmneziaWG"
+        log "removing existing Linux device"
+
+        if ! ip link delete "$iface"; then
+            log "ERROR: unable to delete $iface"
+            return 1
+        fi
+
+        sleep 1
+    fi
+
+    log "creating $iface type amneziawg"
+
+    if ! ip link add "$iface" type amneziawg; then
+        log "ERROR: unable to create $iface"
+        return 1
+    fi
+
+    if ! is_awg_interface "$iface"; then
+        log "ERROR: $iface is not AmneziaWG"
+        return 1
+    fi
+
+    return 0
+}
+
+
+#
+# ---------------------------------------------------------
+# Readiness
+# ---------------------------------------------------------
+#
+
+wait_ready()
+{
+    iface="$1"
+    ndms="$2"
+
+    count=0
+
+    while [ "$count" -lt 30 ]; do
+
+        linux_ready=0
+        ndms_ready=0
+
+        if ip link show "$iface" 2>/dev/null |
+            grep -q 'LOWER_UP'; then
+            linux_ready=1
+        fi
+
+        if ndmc -c "show interface $ndms" 2>/dev/null |
+            grep -q 'link: up'; then
+            ndms_ready=1
+        fi
+
+        if [ "$linux_ready" -eq 1 ] &&
+           [ "$ndms_ready" -eq 1 ]; then
+            return 0
+        fi
+
+        count=$((count + 1))
+
+        sleep 2
+    done
+
+    return 1
+}
+
+
+#
+# ---------------------------------------------------------
+# Configure one tunnel
+# ---------------------------------------------------------
+#
+
+configure_tunnel()
+{
+    source="$1"
+    index="$2"
+
+    filename="${source##*/}"
+    description="${filename%.conf}"
+
+    linux_iface="${IFACE_PREFIX}${index}"
+    ndms_iface="${NDMS_PREFIX}${index}"
+
+    awg_conf="$PARSED_DIR/${linux_iface}.awg.conf"
+    ndms_sh="$PARSED_DIR/${linux_iface}.ndms.sh"
+
+    log "----------------------------------------"
+    log "source      : $source"
+    log "index       : $index"
+    log "linux       : $linux_iface"
+    log "NDMS        : $ndms_iface"
+    log "description : $description"
+    log "----------------------------------------"
+
+    #
+    # 1. NDMS interface.
+    #
+    if ! ndms_create "$ndms_iface"; then
+        return 1
+    fi
+
+    #
+    # 2. Description.
+    #
+    if ! ndms_description \
+        "$ndms_iface" \
+        "$description"; then
+
+        log "ERROR: cannot set description on $ndms_iface"
+        return 1
+    fi
+
+    #
+    # 3. Linux AWG device.
+    #
+    if ! ensure_awg_device "$linux_iface"; then
+        return 1
+    fi
+
+    #
+    # 4. Split configuration.
+    #
+    log "parsing configuration"
+
+    if ! "$SPLITTER" \
+        "$source" \
+        "$linux_iface" \
+        "$ndms_iface"; then
+
+        log "ERROR: configuration parser failed"
+        return 1
+    fi
+
+    if [ ! -s "$awg_conf" ]; then
+        log "ERROR: AWG configuration was not generated"
+        return 1
+    fi
+
+    if [ ! -s "$ndms_sh" ]; then
+        log "ERROR: NDMS configuration was not generated"
+        return 1
+    fi
+
+    #
+    # 5. Configure AmneziaWG.
+    #
+    log "loading AWG configuration"
+
+    if ! "$AWG" setconf \
+        "$linux_iface" \
+        "$awg_conf"; then
+
+        log "ERROR: awg setconf failed"
+        return 1
+    fi
+
+    #
+    # 6. Configure NDMS.
+    #
+    log "applying NDMS configuration"
+
+    if ! ndms_apply_config "$ndms_sh"; then
+        log "ERROR: NDMS configuration failed"
+        return 1
+    fi
+
+    #
+    # 7. Explicitly bring Linux interface up.
+    #
+    log "bringing $linux_iface up"
+
+    if ! ip link set "$linux_iface" up; then
+        log "ERROR: unable to bring $linux_iface up"
+        return 1
+    fi
+
+    #
+    # 8. Wait for NDMS/Linux readiness.
+    #
+    log "waiting for $ndms_iface"
+
+    if ! wait_ready "$linux_iface" "$ndms_iface"; then
+        log "WARNING: $ndms_iface did not become fully ready"
+        return 1
+    fi
+
+    log "$ndms_iface is UP"
+
+    return 0
+}
+
+
+#
+# ---------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------
+#
+
+save_ndms_configuration()
+{
+    ndmc -c "system configuration save" \
+        >/dev/null 2>&1 || true
+}
+
+
+#
+# ---------------------------------------------------------
+# START
+# ---------------------------------------------------------
+#
+
+start()
+{
+    log "starting"
+
+    if ! check_requirements; then
+        return 1
+    fi
+
+    if [ ! -d "$CONF_DIR" ]; then
+        log "ERROR: missing configuration directory: $CONF_DIR"
+        return 1
+    fi
+
+    mkdir -p "$STATE_DIR"
+    mkdir -p "$PARSED_DIR"
+
+    #
+    # Load kernel module.
+    #
+    if grep -q '^amneziawg ' /proc/modules 2>/dev/null; then
+        log "kernel module already loaded"
+    else
+        log "loading kernel module"
+
+        if ! /opt/sbin/insmod "$MODULE"; then
+            log "ERROR: unable to load kernel module"
+            return 1
+        fi
+    fi
+
+    #
+    # Remove only Linux AWG devices which were managed
+    # during the previous successful start.
+    #
+    cleanup_old_linux
+
+    #
+    # Remove generated files.
+    #
+    prepare_parsed
+
+    NEW_STATE="${STATE_FILE}.new"
+
+    rm -f "$NEW_STATE"
+
+    found=0
+    failed=0
+
+    #
+    # Process all configuration files in lexical order.
+    #
+    for source in "$CONF_DIR"/*.conf; do
+
+        [ -f "$source" ] || continue
+
+        found=1
+
+        #
+        # Try to preserve the previous index assigned
+        # to this exact configuration file.
+        #
+        index=""
+
+        if [ -f "$STATE_FILE" ]; then
+            index="$(state_get_index "$source" 2>/dev/null || true)"
+        fi
+
+        #
+        # Validate previously stored index.
+        #
+        if [ -n "$index" ]; then
+
+            case "$index" in
+                ''|*[!0-9]*)
+                    log "WARNING: invalid stored index for $source: $index"
+                    index=""
+                    ;;
+            esac
+
+            if [ -n "$index" ] &&
+               [ "$index" -gt "$MAX_INDEX" ]; then
+                log "WARNING: stored index out of range for $source: $index"
+                index=""
+            fi
+        fi
+
+        #
+        # New configuration:
+        # allocate first free index.
+        #
+        if [ -z "$index" ]; then
+
+            index="$(find_free_index "$NEW_STATE" 2>/dev/null || true)"
+
+            if [ -z "$index" ]; then
+                log "ERROR: no free OpkgTun index available"
+                failed=1
+                continue
+            fi
+        fi
+
+        #
+        # Make absolutely sure this index is not already
+        # owned by another configuration processed earlier.
+        #
+        if new_state_has_index "$index" "$NEW_STATE"; then
+
+            owner="$(state_index_owned_by "$index" 2>/dev/null || true)"
+
+            log "ERROR: index collision"
+            log "       index : $index"
+            log "       source: $source"
+            log "       owner : ${owner:-unknown}"
+
+            failed=1
+            continue
+        fi
+
+        #
+        # Start this tunnel.
+        #
+        if configure_tunnel "$source" "$index"; then
+
+            printf '%s\t%s\t%s\n' \
+                "$source" \
+                "$index" \
+                "${NDMS_PREFIX}${index}" \
+                >> "$NEW_STATE"
+
+        else
+            log "ERROR: failed to start $source"
+            failed=1
+        fi
+
+    done
+
+    #
+    # Replace state with the state of THIS startup.
+    #
+    if [ -f "$NEW_STATE" ]; then
+        mv "$NEW_STATE" "$STATE_FILE"
+    else
+        rm -f "$NEW_STATE"
+        rm -f "$STATE_FILE"
+    fi
+
+    if [ "$found" -eq 0 ]; then
+        log "no configuration files found"
+    fi
+
+    #
+    # Persist NDMS configuration.
+    #
+    save_ndms_configuration
+
+    if [ "$failed" -ne 0 ]; then
+        log "startup completed with errors"
+        return 1
+    fi
+
+    log "startup complete"
+
+    return 0
+}
+
+
+#
+# ---------------------------------------------------------
+# STOP
+# ---------------------------------------------------------
+#
+
+stop()
+{
+    log "stopping"
+
+    if [ ! -f "$STATE_FILE" ]; then
+        log "no managed state"
+        return 0
+    fi
+
+    while IFS="$(printf '\t')" read -r source index ndms; do
+
+        [ -n "$index" ] || continue
+
+        iface="${IFACE_PREFIX}${index}"
+
+        if linux_iface_exists "$iface"; then
+
+            if is_awg_interface "$iface"; then
+                log "bringing $iface down"
+
+                ip link set "$iface" down \
+                    >/dev/null 2>&1 || true
+            fi
+        fi
+
+        if [ -n "$ndms" ] &&
+           ndms_exists "$ndms"; then
+
+            ndmc -c "interface $ndms down" \
+                >/dev/null 2>&1 || true
+        fi
+
+    done < "$STATE_FILE"
+}
+
+
+#
+# ---------------------------------------------------------
+# RESTART
+# ---------------------------------------------------------
+#
+
+restart()
+{
+    stop
+
+    sleep 1
+
+    start
+}
+
+
+#
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+#
+
+case "${1:-start}" in
+
+    start)
+        start
+        ;;
+
+    stop)
+        stop
+        ;;
+
+    restart)
+        restart
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+
+esac

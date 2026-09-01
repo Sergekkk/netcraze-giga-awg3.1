@@ -1,0 +1,194 @@
+#!/bin/sh
+
+set -eu
+
+INPUT="${1:-}"
+LINUX_IFACE="${2:-opkgtun0}"
+NDMS_IFACE="${3:-OpkgTun0}"
+
+if [ -z "$INPUT" ] || [ ! -f "$INPUT" ]; then
+    echo "Usage: $0 <config.conf> [linux-interface] [ndms-interface]" >&2
+    exit 1
+fi
+
+OUTDIR="/opt/etc/awg3/conf/parsed"
+AWG_CONF="$OUTDIR/${LINUX_IFACE}.awg.conf"
+NDMS_SH="$OUTDIR/${LINUX_IFACE}.ndms.sh"
+
+mkdir -p "$OUTDIR"
+
+rm -f "$AWG_CONF" "$NDMS_SH"
+
+cat > "$NDMS_SH" <<EOF2
+#!/bin/sh
+set -eu
+
+LINUX_IFACE="$LINUX_IFACE"
+NDMS_IFACE="$NDMS_IFACE"
+
+EOF2
+
+section=""
+
+while IFS= read -r line || [ -n "$line" ]; do
+
+    line="${line%$'\r'}"
+
+    case "$line" in
+        '')
+            printf '\n' >> "$AWG_CONF"
+            continue
+            ;;
+    esac
+
+    case "$line" in
+        \#*)
+            printf '%s\n' "$line" >> "$AWG_CONF"
+            continue
+            ;;
+    esac
+
+    case "$line" in
+        '[Interface]'|'[interface]')
+            section="interface"
+            printf '[Interface]\n' >> "$AWG_CONF"
+            continue
+            ;;
+        '[Peer]'|'[peer]')
+            section="peer"
+            printf '\n[Peer]\n' >> "$AWG_CONF"
+            continue
+            ;;
+    esac
+
+    case "$line" in
+        *=*)
+            ;;
+        *)
+            echo "ERROR: malformed line:" >&2
+            echo "  $line" >&2
+            exit 1
+            ;;
+    esac
+
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    key="$(printf '%s' "$key" |
+        sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    value="$(printf '%s' "$value" |
+        sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    case "$section:$key" in
+
+        interface:PrivateKey|\
+        interface:Jc|\
+        interface:Jmin|\
+        interface:Jmax|\
+        interface:S1|\
+        interface:S2|\
+        interface:S3|\
+        interface:S4|\
+        interface:H1|\
+        interface:H2|\
+        interface:H3|\
+        interface:H4|\
+        interface:HeaderProtectionKey|\
+        interface:ContentPaddingAddition|\
+        interface:RekeyAfterTime|\
+        interface:RekeyTimeout|\
+        interface:RejectAfterTime|\
+        interface:KeepaliveTimeout|\
+        interface:MaxHandshakeAttempts|\
+        interface:RandomTrailers|\
+        interface:DisableCookies)
+
+            printf '%s = %s\n' "$key" "$value" >> "$AWG_CONF"
+            ;;
+
+        interface:Address)
+
+            OLDIFS="$IFS"
+            IFS=','
+            set -- $value
+            IFS="$OLDIFS"
+
+            for addr in "$@"; do
+                addr="$(printf '%s' "$addr" |
+                    sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+                ip="${addr%/*}"
+                prefix="${addr#*/}"
+
+                case "$prefix" in
+                    0)  mask="0.0.0.0" ;;
+                    8)  mask="255.0.0.0" ;;
+                    16) mask="255.255.0.0" ;;
+                    24) mask="255.255.255.0" ;;
+                    32) mask="255.255.255.255" ;;
+                    *)
+                        echo "ERROR: unsupported IPv4 prefix: $addr" >&2
+                        exit 1
+                        ;;
+                esac
+
+                echo "ndmc -c \"interface \$NDMS_IFACE ip address $ip $mask\"" >> "$NDMS_SH"
+            done
+            ;;
+
+        interface:MTU)
+            echo "ndmc -c \"interface \$NDMS_IFACE ip mtu $value\"" >> "$NDMS_SH"
+            ;;
+
+        interface:DNS)
+
+            OLDIFS="$IFS"
+            IFS=','
+            set -- $value
+            IFS="$OLDIFS"
+
+            for dns in "$@"; do
+                dns="$(printf '%s' "$dns" |
+                    sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+                [ -n "$dns" ] || continue
+
+                echo "ndmc -c \"interface \$NDMS_IFACE ip name-server $dns \\\"\\\" on \$NDMS_IFACE\"" >> "$NDMS_SH"
+            done
+            ;;
+
+        peer:PublicKey|\
+        peer:PresharedKey|\
+        peer:AllowedIPs|\
+        peer:Endpoint|\
+        peer:PersistentKeepalive)
+
+            printf '%s = %s\n' "$key" "$value" >> "$AWG_CONF"
+            ;;
+
+        *)
+            echo "ERROR: unsupported parameter:" >&2
+            echo "  section = [$section]" >&2
+            echo "  key     = [$key]" >&2
+            echo "  value   = [$value]" >&2
+            exit 1
+            ;;
+
+    esac
+
+done < "$INPUT"
+
+cat >> "$NDMS_SH" <<EOF2
+
+ndmc -c "interface \$NDMS_IFACE ip global auto"
+ndmc -c "interface \$NDMS_IFACE ip tcp adjust-mss pmtu"
+ndmc -c "interface \$NDMS_IFACE up"
+EOF2
+
+chmod 600 "$AWG_CONF"
+chmod 700 "$NDMS_SH"
+
+echo "Created:"
+echo "  AWG3 : $AWG_CONF"
+echo "  NDMS : $NDMS_SH"
