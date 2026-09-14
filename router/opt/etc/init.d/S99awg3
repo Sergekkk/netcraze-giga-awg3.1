@@ -643,6 +643,8 @@ configure_tunnel()
         return 1
     fi
 
+    sleep 3
+
     #
     # 5. Configure AmneziaWG.
     #
