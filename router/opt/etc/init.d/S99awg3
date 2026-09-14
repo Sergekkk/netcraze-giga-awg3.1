@@ -293,16 +293,179 @@ prepare_parsed()
 
 cleanup_old_state()
 {
-    [ -f "$STATE_FILE" ] || return 0
-
     log "cleaning up previously managed interfaces"
 
-    while IFS="$(printf '\t')" read -r source index ndms; do
+    #
+    # -----------------------------------------------------
+    # CASE 1:
+    # managed.tsv does NOT exist.
+    #
+    # There is no ownership information.
+    # Remove all OpkgTunN interfaces and corresponding
+    # Linux AmneziaWG devices, then start from scratch.
+    # -----------------------------------------------------
+    #
 
-        [ -n "$index" ] || continue
+    if [ ! -f "$STATE_FILE" ]; then
 
+        log "managed state file not found"
+        log "removing all existing OpkgTun interfaces"
+
+        index=0
+
+        while [ "$index" -le "$MAX_INDEX" ]; do
+
+            ndms="${NDMS_PREFIX}${index}"
+            iface="${IFACE_PREFIX}${index}"
+
+            #
+            # Remove Linux device if it exists and is AWG.
+            #
+            if linux_iface_exists "$iface"; then
+
+                if is_awg_interface "$iface"; then
+                    log "deleting Linux device $iface"
+
+                    ip link delete "$iface" \
+                        >/dev/null 2>&1 || true
+                fi
+            fi
+
+            #
+            # Remove corresponding NDMS OpkgTun interface.
+            #
+            if ndms_exists "$ndms"; then
+
+                if ndms_is_opkgtun "$ndms"; then
+                    log "removing NDMS interface $ndms"
+
+                    ndmc -c "no interface $ndms" \
+                        >/dev/null 2>&1 || true
+                fi
+            fi
+
+            index=$((index + 1))
+        done
+
+        return 0
+    fi
+
+    #
+    # -----------------------------------------------------
+    # CASE 2:
+    # managed.tsv exists.
+    #
+    # Scan ALL possible OpkgTunN interfaces.
+    #
+    # A tunnel is valid only when its index is present in
+    # managed.tsv AND the corresponding configuration file
+    # still exists.
+    #
+    # Anything else is an orphan and must be removed.
+    # -----------------------------------------------------
+    #
+
+    index=0
+
+    while [ "$index" -le "$MAX_INDEX" ]; do
+
+        ndms="${NDMS_PREFIX}${index}"
         iface="${IFACE_PREFIX}${index}"
 
+        #
+        # If neither side exists, nothing to clean.
+        #
+        if ! linux_iface_exists "$iface" &&
+           ! ndms_exists "$ndms"; then
+
+            index=$((index + 1))
+            continue
+        fi
+
+        #
+        # We only handle OpkgTun interfaces.
+        #
+        if ndms_exists "$ndms"; then
+
+            if ! ndms_is_opkgtun "$ndms"; then
+                index=$((index + 1))
+                continue
+            fi
+        fi
+
+        #
+        # Find configuration owning this index.
+        #
+        source="$(state_index_owned_by "$index" 2>/dev/null || true)"
+
+        #
+        # If there is no owner in managed.tsv, this is orphaned.
+        #
+        if [ -z "$source" ]; then
+
+            log "removing orphaned tunnel"
+            log "  Linux: $iface"
+            log "  NDMS : $ndms"
+            log "  reason: index is not present in managed.tsv"
+
+            if linux_iface_exists "$iface"; then
+
+                if is_awg_interface "$iface"; then
+                    log "deleting Linux device $iface"
+
+                    ip link delete "$iface" \
+                        >/dev/null 2>&1 || true
+                fi
+            fi
+
+            if ndms_exists "$ndms"; then
+                log "removing NDMS interface $ndms"
+
+                ndmc -c "no interface $ndms" \
+                    >/dev/null 2>&1 || true
+            fi
+
+            index=$((index + 1))
+            continue
+        fi
+
+        #
+        # The index is known, but the configuration file
+        # was deleted.
+        #
+        if [ ! -f "$source" ]; then
+
+            log "removing orphaned tunnel"
+            log "  Linux: $iface"
+            log "  NDMS : $ndms"
+            log "  config: $source"
+
+            if linux_iface_exists "$iface"; then
+
+                if is_awg_interface "$iface"; then
+                    log "deleting Linux device $iface"
+
+                    ip link delete "$iface" \
+                        >/dev/null 2>&1 || true
+                fi
+            fi
+
+            if ndms_exists "$ndms"; then
+                log "removing NDMS interface $ndms"
+
+                ndmc -c "no interface $ndms" \
+                    >/dev/null 2>&1 || true
+            fi
+
+            index=$((index + 1))
+            continue
+        fi
+
+        #
+        # Configuration exists.
+        # Linux device will be deleted and recreated below
+        # by configure_tunnel().
+        #
         if linux_iface_exists "$iface"; then
 
             if is_awg_interface "$iface"; then
@@ -313,19 +476,9 @@ cleanup_old_state()
             fi
         fi
 
-        # If configuration file was deleted, remove NDMS interface as well
-        if [ ! -f "$source" ]; then
-            if [ -n "$ndms" ] && ndms_exists "$ndms"; then
-                log "removing orphaned NDMS interface $ndms (config deleted: $source)"
-
-                ndmc -c "no interface $ndms" \
-                    >/dev/null 2>&1 || true
-            fi
-        fi
-
-    done < "$STATE_FILE"
+        index=$((index + 1))
+    done
 }
-
 
 #
 # ---------------------------------------------------------
