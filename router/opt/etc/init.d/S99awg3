@@ -18,14 +18,21 @@ NDMS_PREFIX="OpkgTun"
 MAX_INDEX=99
 
 
+LOG_DIR="/opt/var/log"
+LOG_FILE="$LOG_DIR/awg3.log"
+mkdir -p "$LOG_DIR"
+
 log()
 {
-    echo "[awg3] $*"
+    message="$*"
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    printf '%s [awg3] %s\n' \
+        "$timestamp" "$message" \
+        >> "$LOG_FILE" 2>/dev/null || true
+
+    echo "[awg3] $message"
 }
-
-
-#
-# ---------------------------------------------------------
 # Basic checks
 # ---------------------------------------------------------
 #
@@ -568,9 +575,54 @@ wait_ready()
 
 #
 # ---------------------------------------------------------
+#
+# ---------------------------------------------------------
 # Configure one tunnel
 # ---------------------------------------------------------
 #
+
+rollback_tunnel()
+{
+    rb_iface="$1"
+    rb_ndms="$2"
+    rb_remove_ndms="${3:-0}"
+
+    log "ROLLBACK: $rb_iface / $rb_ndms"
+
+    if linux_iface_exists "$rb_iface"; then
+        if is_awg_interface "$rb_iface"; then
+            log "rollback: bringing $rb_iface down"
+            ip link set "$rb_iface" down \
+                >/dev/null 2>&1 || true
+
+            log "rollback: flushing routes from $rb_iface"
+            ip route flush dev "$rb_iface" \
+                >/dev/null 2>&1 || true
+
+            log "rollback: deleting $rb_iface"
+            ip link delete "$rb_iface" \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if ndms_exists "$rb_ndms"; then
+        if ndms_is_opkgtun "$rb_ndms"; then
+
+            if [ "$rb_remove_ndms" -eq 1 ]; then
+                log "rollback: removing $rb_ndms"
+
+                ndmc -c "no interface $rb_ndms" \
+                    >/dev/null 2>&1 || true
+            else
+                log "rollback: bringing $rb_ndms down"
+
+                ndmc -c "interface $rb_ndms down" \
+                    >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+}
+
 
 configure_tunnel()
 {
@@ -586,6 +638,8 @@ configure_tunnel()
     awg_conf="$PARSED_DIR/${linux_iface}.awg.conf"
     ndms_sh="$PARSED_DIR/${linux_iface}.ndms.sh"
 
+    ndms_created=0
+
     log "----------------------------------------"
     log "source      : $source"
     log "index       : $index"
@@ -597,7 +651,16 @@ configure_tunnel()
     #
     # 1. NDMS interface.
     #
+    if ! ndms_exists "$ndms_iface"; then
+        ndms_created=1
+    fi
+
     if ! ndms_create "$ndms_iface"; then
+        log "ERROR: cannot create $ndms_iface"
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
         return 1
     fi
 
@@ -609,6 +672,12 @@ configure_tunnel()
         "$description"; then
 
         log "ERROR: cannot set description on $ndms_iface"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
@@ -616,6 +685,14 @@ configure_tunnel()
     # 3. Linux AWG device.
     #
     if ! ensure_awg_device "$linux_iface"; then
+
+        log "ERROR: cannot prepare $linux_iface"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
@@ -630,16 +707,34 @@ configure_tunnel()
         "$ndms_iface"; then
 
         log "ERROR: configuration parser failed"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
     if [ ! -s "$awg_conf" ]; then
         log "ERROR: AWG configuration was not generated"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
     if [ ! -s "$ndms_sh" ]; then
         log "ERROR: NDMS configuration was not generated"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
@@ -655,6 +750,12 @@ configure_tunnel()
         "$awg_conf"; then
 
         log "ERROR: awg setconf failed"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
@@ -664,7 +765,14 @@ configure_tunnel()
     log "applying NDMS configuration"
 
     if ! ndms_apply_config "$ndms_sh"; then
+
         log "ERROR: NDMS configuration failed"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
@@ -674,7 +782,14 @@ configure_tunnel()
     log "bringing $linux_iface up"
 
     if ! ip link set "$linux_iface" up; then
+
         log "ERROR: unable to bring $linux_iface up"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
@@ -684,7 +799,14 @@ configure_tunnel()
     log "waiting for $ndms_iface"
 
     if ! wait_ready "$linux_iface" "$ndms_iface"; then
-        log "WARNING: $ndms_iface did not become fully ready"
+
+        log "ERROR: $ndms_iface did not become fully ready"
+
+        rollback_tunnel \
+            "$linux_iface" \
+            "$ndms_iface" \
+            "$ndms_created"
+
         return 1
     fi
 
@@ -692,10 +814,6 @@ configure_tunnel()
 
     return 0
 }
-
-
-#
-# ---------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------
 #
@@ -832,16 +950,24 @@ start()
         fi
 
         #
-        # Start this tunnel.
         #
+        # Reserve ownership BEFORE attempting startup.
+        # A failed tunnel must remain in managed.tsv so that
+        # a later start/watchdog can repair it.
+        #
+        if ! printf '%s\t%s\t%s\n' \
+            "$source" \
+            "$index" \
+            "${NDMS_PREFIX}${index}" \
+            >> "$NEW_STATE"; then
+
+            log "ERROR: unable to write state for $source"
+            failed=1
+            continue
+        fi
+
         if configure_tunnel "$source" "$index"; then
-
-            printf '%s\t%s\t%s\n' \
-                "$source" \
-                "$index" \
-                "${NDMS_PREFIX}${index}" \
-                >> "$NEW_STATE"
-
+            log "started $source"
         else
             log "ERROR: failed to start $source"
             failed=1
@@ -923,6 +1049,55 @@ stop()
 
 #
 # ---------------------------------------------------------
+#
+# ---------------------------------------------------------
+# REPAIR ONE
+# ---------------------------------------------------------
+#
+
+repair()
+{
+    index="$1"
+
+    case "$index" in
+        ''|*[!0-9]*)
+            log "ERROR: invalid repair index: $index"
+            return 1
+            ;;
+    esac
+
+    if [ "$index" -gt "$MAX_INDEX" ]; then
+        log "ERROR: repair index out of range: $index"
+        return 1
+    fi
+
+    source="$(state_index_owned_by "$index" 2>/dev/null || true)"
+
+    if [ -z "$source" ]; then
+        log "ERROR: no managed configuration for index $index"
+        return 1
+    fi
+
+    if [ ! -f "$source" ]; then
+        log "ERROR: managed configuration does not exist: $source"
+        return 1
+    fi
+
+    log "repairing index $index"
+    log "  source: $source"
+
+    if ! configure_tunnel "$source" "$index"; then
+        log "ERROR: repair failed for index $index"
+        return 1
+    fi
+
+    save_ndms_configuration
+
+    log "repair complete for index $index"
+
+    return 0
+}
+
 # RESTART
 # ---------------------------------------------------------
 #
@@ -951,6 +1126,10 @@ case "${1:-start}" in
 
     stop)
         stop
+        ;;
+
+    repair)
+        repair "$2"
         ;;
 
     restart)

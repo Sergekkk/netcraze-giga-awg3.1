@@ -1,0 +1,380 @@
+#!/bin/sh
+
+PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+S99="/opt/etc/init.d/S99awg3"
+AWG="/opt/bin/awg"
+
+STATE_FILE="/opt/etc/awg3/managed.tsv"
+WD_STATE="/opt/etc/awg3/watchdog.state"
+
+LOG_DIR="/opt/var/log"
+LOG_FILE="$LOG_DIR/awg3-watchdog.log"
+
+PIDFILE="/opt/etc/awg3/watchdog.pid"
+
+CHECK_INTERVAL=30
+HANDSHAKE_MAX_AGE=130
+INTERFACE_GRACE=130
+REPAIR_COOLDOWN=180
+
+QUIET=0
+
+mkdir -p "$LOG_DIR" /opt/etc/awg3
+
+
+wd_log()
+{
+    message="$*"
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    printf '%s [watchdog] %s\n' \
+        "$timestamp" "$message" \
+        >> "$LOG_FILE"
+
+    if [ "$QUIET" -eq 0 ]; then
+        printf '%s [watchdog] %s\n' \
+            "$timestamp" "$message"
+    fi
+}
+
+
+is_running()
+{
+    [ -s "$PIDFILE" ] || return 1
+
+    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+
+    [ -n "$pid" ] || return 1
+
+    kill -0 "$pid" 2>/dev/null
+}
+
+
+get_last_repair()
+{
+    iface="$1"
+
+    [ -f "$WD_STATE" ] || return 1
+
+    awk -F '' -v i="$iface" '
+        $1 == i {
+            print $2
+            exit
+        }
+    ' "$WD_STATE"
+}
+
+
+set_last_repair()
+{
+    iface="$1"
+    ts="$2"
+
+    TMP="${WD_STATE}.tmp"
+
+    if [ -f "$WD_STATE" ]; then
+        awk -F '' -v i="$iface" -v t="$ts" '
+            BEGIN {
+                OFS="\t"
+            }
+            $1 == i {
+                $2=t
+                found=1
+            }
+            {
+                print
+            }
+            END {
+                if (!found)
+                    print i,t
+            }
+        ' "$WD_STATE" > "$TMP"
+    else
+        printf '%s\t%s\n' "$iface" "$ts" > "$TMP"
+    fi
+
+    mv "$TMP" "$WD_STATE"
+}
+
+
+ndms_uptime()
+{
+    ndms="$1"
+
+    ndmc -c "show interface $ndms" 2>/dev/null |
+        awk '
+            /^[[:space:]]*uptime:/ {
+                print $2
+                exit
+            }
+        '
+}
+
+
+ndms_is_up()
+{
+    ndms="$1"
+
+    ndmc -c "show interface $ndms" 2>/dev/null |
+        grep -q 'link: up'
+}
+
+
+latest_handshake()
+{
+    iface="$1"
+
+    "$AWG" show "$iface" latest-handshakes 2>/dev/null |
+        awk 'NF { print $NF; exit }'
+}
+
+
+repair_one()
+{
+    source="$1"
+    index="$2"
+    ndms="$3"
+    iface="opkgtun${index}"
+
+    now="$(date +%s)"
+    last="$(get_last_repair "$iface" 2>/dev/null || true)"
+
+    if [ -n "$last" ]; then
+        case "$last" in
+            ''|*[!0-9]*)
+                ;;
+            *)
+                age=$((now - last))
+                if [ "$age" -lt "$REPAIR_COOLDOWN" ]; then
+                    return 0
+                fi
+                ;;
+        esac
+    fi
+
+    wd_log "RECOVERY: $iface"
+    wd_log "  source: $source"
+    wd_log "  reason: $4"
+
+    set_last_repair "$iface" "$now"
+
+    if "$S99" repair "$index"; then
+        wd_log "RECOVERY OK: $iface"
+    else
+        wd_log "RECOVERY FAILED: $iface"
+    fi
+}
+
+
+check_one()
+{
+    source="$1"
+    index="$2"
+    ndms="$3"
+
+    iface="opkgtun${index}"
+
+    #
+    # Missing Linux or NDMS interface = immediate recovery.
+    #
+    if ! ip link show "$iface" >/dev/null 2>&1; then
+        repair_one "$source" "$index" "$ndms" "Linux interface missing"
+        return
+    fi
+
+    if ! ndmc -c "show interface $ndms" >/dev/null 2>&1; then
+        repair_one "$source" "$index" "$ndms" "NDMS interface missing"
+        return
+    fi
+
+    #
+    # Interface exists but isn't operational.
+    #
+    if ! ndms_is_up "$ndms"; then
+        repair_one "$source" "$index" "$ndms" "NDMS link down"
+        return
+    fi
+
+    #
+    # Don't judge handshake immediately after interface startup.
+    #
+    uptime="$(ndms_uptime "$ndms" 2>/dev/null || true)"
+
+    case "$uptime" in
+        ''|*[!0-9]*)
+            uptime=0
+            ;;
+    esac
+
+    if [ "$uptime" -lt "$INTERFACE_GRACE" ]; then
+        return
+    fi
+
+    #
+    # AWG peer must have a recent handshake.
+    #
+    hs="$(latest_handshake "$iface")"
+
+    #
+    # No peer / no handshake.
+    #
+    if [ -z "$hs" ] || [ "$hs" = "0" ]; then
+        repair_one "$source" "$index" "$ndms" \
+            "handshake timestamp is zero/missing"
+        return
+    fi
+
+    case "$hs" in
+        ''|*[!0-9]*)
+            repair_one "$source" "$index" "$ndms" \
+                "invalid handshake timestamp"
+            return
+            ;;
+    esac
+
+    now="$(date +%s)"
+    age=$((now - hs))
+
+    #
+    # Clock going backwards: don't trigger recovery.
+    #
+    if [ "$age" -lt 0 ]; then
+        return
+    fi
+
+    if [ "$age" -gt "$HANDSHAKE_MAX_AGE" ]; then
+        repair_one "$source" "$index" "$ndms" \
+            "handshake age ${age}s > ${HANDSHAKE_MAX_AGE}s"
+    fi
+}
+
+
+check_all()
+{
+    [ -f "$STATE_FILE" ] || return 0
+
+    TAB="$(printf '\t')"
+
+    while IFS="$TAB" read -r source index ndms; do
+
+        [ -n "$source" ] || continue
+        [ -n "$index" ] || continue
+        [ -n "$ndms" ] || continue
+
+        [ -f "$source" ] || continue
+
+        check_one "$source" "$index" "$ndms"
+
+    done < "$STATE_FILE"
+}
+
+
+start()
+{
+    if is_running; then
+        wd_log "already running"
+        return 0
+    fi
+
+    rm -f "$PIDFILE"
+
+    (
+        QUIET=1
+        export QUIET
+
+        trap 'exit 0' TERM INT
+
+        wd_log "started"
+        wd_log "check interval: ${CHECK_INTERVAL}s"
+        wd_log "handshake threshold: ${HANDSHAKE_MAX_AGE}s"
+        wd_log "repair cooldown: ${REPAIR_COOLDOWN}s"
+
+        while :; do
+            check_all
+            sleep "$CHECK_INTERVAL"
+        done
+
+    ) &
+
+    echo $! > "$PIDFILE"
+
+    sleep 1
+
+    if is_running; then
+        echo "watchdog started, pid=$(cat "$PIDFILE")"
+        return 0
+    fi
+
+    rm -f "$PIDFILE"
+    echo "ERROR: watchdog failed to start"
+    return 1
+}
+
+
+stop()
+{
+    if ! is_running; then
+        rm -f "$PIDFILE"
+        echo "watchdog not running"
+        return 0
+    fi
+
+    pid="$(cat "$PIDFILE")"
+
+    kill -TERM "$pid" 2>/dev/null || true
+
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+
+    rm -f "$PIDFILE"
+
+    echo "watchdog stopped"
+}
+
+
+status()
+{
+    if is_running; then
+        echo "watchdog: RUNNING pid=$(cat "$PIDFILE")"
+        return 0
+    fi
+
+    echo "watchdog: STOPPED"
+    return 1
+}
+
+
+case "${1:-start}" in
+
+    start)
+        start
+        ;;
+
+    stop)
+        stop
+        ;;
+
+    restart)
+        stop
+        sleep 1
+        start
+        ;;
+
+    check)
+        check_all
+        ;;
+
+    status)
+        status
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart|check|status}" >&2
+        exit 1
+        ;;
+
+esac
