@@ -964,6 +964,64 @@ stop()
 # ---------------------------------------------------------
 #
 
+#
+# ---------------------------------------------------------
+# Handshake helpers
+# ---------------------------------------------------------
+#
+
+awg_latest_handshake()
+{
+    iface="$1"
+
+    "$AWG" show "$iface" latest-handshakes 2>/dev/null |
+        awk 'NF { print $NF; exit }'
+}
+
+
+wait_handshake()
+{
+    iface="$1"
+    old_hs="$2"
+
+    timeout=60
+    elapsed=0
+
+    log "waiting for new handshake on $iface"
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+
+        hs="$(awg_latest_handshake "$iface" 2>/dev/null || true)"
+
+        case "$hs" in
+            ''|*[!0-9]*)
+                ;;
+            *)
+                if [ -z "$old_hs" ] || [ "$old_hs" = "0" ]; then
+                    if [ "$hs" -gt 0 ]; then
+                        log "new handshake received on $iface"
+                        log "  handshake: $hs"
+                        return 0
+                    fi
+                else
+                    if [ "$hs" -gt "$old_hs" ]; then
+                        log "new handshake received on $iface"
+                        log "  old: $old_hs"
+                        log "  new: $hs"
+                        return 0
+                    fi
+                fi
+                ;;
+        esac
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    log "ERROR: no new handshake on $iface after ${timeout}s"
+    return 1
+}
+
 repair()
 {
     index="$1"
@@ -995,43 +1053,52 @@ repair()
     linux_iface="${IFACE_PREFIX}${index}"
     ndms_iface="${NDMS_PREFIX}${index}"
 
+    old_hs="$(awg_latest_handshake "$linux_iface" 2>/dev/null || true)"
+
     log "repairing index $index"
     log "  source: $source"
     log "  linux : $linux_iface"
     log "  NDMS  : $ndms_iface"
+    log "  old handshake: ${old_hs:-0}"
 
     #
-    # If the Linux device exists, keep it.
-    # ip link delete is deliberately forbidden here because
-    # that would remove routes attached to the interface.
+    # Restart the existing interfaces without deleting them.
+    # Routes remain attached to the interfaces.
     #
     if linux_iface_exists "$linux_iface"; then
-
-        if ! is_awg_interface "$linux_iface"; then
+        if is_awg_interface "$linux_iface"; then
+            log "repair: bringing $linux_iface down"
+            ip link set "$linux_iface" down \
+                >/dev/null 2>&1 || true
+        else
             log "ERROR: $linux_iface exists but is not AmneziaWG"
+            log "ERROR: refusing to delete existing Linux interface"
             return 1
         fi
-
-        log "repair: bringing $linux_iface down"
-        ip link set "$linux_iface" down \
-            >/dev/null 2>&1 || true
     fi
 
-    #
-    # Keep NDMS interface too.
-    #
     if ndms_exists "$ndms_iface"; then
-        log "repair: bringing $ndms_iface down"
-        ndmc -c "interface $ndms_iface down" \
-            >/dev/null 2>&1 || true
+        if ndms_is_opkgtun "$ndms_iface"; then
+            log "repair: bringing $ndms_iface down"
+            ndmc -c "interface $ndms_iface down" \
+                >/dev/null 2>&1 || true
+        fi
     fi
 
     #
-    # configure_tunnel() will reuse the existing Linux/NDMS objects,
-    # reload AWG configuration and bring them back up.
+    # Reload the AWG/NDMS configuration and bring interfaces up.
     #
     if ! configure_tunnel "$source" "$index"; then
-        log "ERROR: repair failed for index $index"
+        log "ERROR: repair configuration failed for index $index"
+        return 1
+    fi
+
+    #
+    # Interface being UP is not enough.
+    # Require a handshake newer than the one seen before repair.
+    #
+    if ! wait_handshake "$linux_iface" "$old_hs"; then
+        log "ERROR: repair failed: no new handshake for index $index"
         return 1
     fi
 
