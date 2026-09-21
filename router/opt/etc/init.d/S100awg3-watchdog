@@ -12,6 +12,7 @@ LOG_DIR="/opt/var/log"
 LOG_FILE="$LOG_DIR/awg3-watchdog.log"
 
 PIDFILE="/opt/etc/awg3/watchdog.pid"
+LOCK_DIR="/opt/etc/awg3/watchdog-repair.lock"
 
 CHECK_INTERVAL=30
 HANDSHAKE_MAX_AGE=130
@@ -148,11 +149,50 @@ latest_handshake()
 }
 
 
+acquire_repair_lock()
+{
+    my_pid="$(sh -c 'echo $PPID' 2>/dev/null || echo $$)"
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf "%s\n" "$my_pid" > "$LOCK_DIR/pid"
+        return 0
+    fi
+
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+
+    case "$pid" in
+        ""|*[!0-9]*)
+            rm -rf "$LOCK_DIR"
+            ;;
+        *)
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -rf "$LOCK_DIR"
+            else
+                return 1
+            fi
+            ;;
+    esac
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf "%s\n" "$my_pid" > "$LOCK_DIR/pid"
+        return 0
+    fi
+
+    return 1
+}
+
+release_repair_lock()
+{
+    rm -rf "$LOCK_DIR"
+}
+
 repair_one()
 {
     source="$1"
     index="$2"
     ndms="$3"
+    reason="$4"
+
     iface="opkgtun${index}"
 
     now="$(date +%s)"
@@ -165,25 +205,47 @@ repair_one()
             *)
                 age=$((now - last))
                 if [ "$age" -lt "$REPAIR_COOLDOWN" ]; then
+                    wd_log "SKIP: $iface recovery cooldown (${age}s/${REPAIR_COOLDOWN}s)"
                     return 0
                 fi
                 ;;
         esac
     fi
 
+    #
+    # Prevent overlapping recovery operations.
+    #
+    if ! acquire_repair_lock; then
+        wd_log "SKIP: $iface recovery already running"
+        return 0
+    fi
+
+    #
+    # Record the recovery attempt before starting it.
+    # Failed recovery is also subject to cooldown.
+    #
+    if ! set_last_repair "$iface" "$now"; then
+        wd_log "ERROR: unable to save recovery timestamp for $iface"
+        release_repair_lock
+        return 1
+    fi
+
     wd_log "RECOVERY: $iface"
     wd_log "  source: $source"
-    wd_log "  reason: $4"
-
-    set_last_repair "$iface" "$now"
+    wd_log "  reason: $reason"
 
     if "$S99" repair "$index"; then
         wd_log "RECOVERY OK: $iface"
+        rc=0
     else
         wd_log "RECOVERY FAILED: $iface"
+        rc=1
     fi
-}
 
+    release_repair_lock
+
+    return "$rc"
+}
 
 check_one()
 {
