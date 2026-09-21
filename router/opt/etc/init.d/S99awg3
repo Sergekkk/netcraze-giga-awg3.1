@@ -22,10 +22,31 @@ LOG_DIR="/opt/var/log"
 LOG_FILE="$LOG_DIR/awg3.log"
 mkdir -p "$LOG_DIR"
 
+LOG_MAX_SIZE=524288
+
+rotate_log()
+{
+    [ -f "$LOG_FILE" ] || return 0
+
+    size="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
+
+    case "$size" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+
+    if [ "$size" -ge "$LOG_MAX_SIZE" ]; then
+        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+    fi
+}
+
 log()
 {
     message="$*"
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    rotate_log
 
     printf '%s [awg3] %s\n' \
         "$timestamp" "$message" \
