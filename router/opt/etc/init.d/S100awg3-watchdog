@@ -4,6 +4,7 @@ PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 S99="/opt/etc/init.d/S99awg3"
 AWG="/opt/bin/awg"
+SELF="/opt/etc/init.d/S100awg3-watchdog"
 
 STATE_FILE="/opt/etc/awg3/managed.tsv"
 WD_STATE="/opt/etc/awg3/watchdog.state"
@@ -76,7 +77,7 @@ get_last_repair()
 
     [ -f "$WD_STATE" ] || return 1
 
-    awk -F '' -v i="$iface" '
+    awk -v i="$iface" '
         $1 == i {
             print $2
             exit
@@ -93,20 +94,27 @@ set_last_repair()
     TMP="${WD_STATE}.tmp"
 
     if [ -f "$WD_STATE" ]; then
-        awk -F '' -v i="$iface" -v t="$ts" '
+        awk -v i="$iface" -v t="$ts" '
             BEGIN {
                 OFS="\t"
+                found=0
             }
+
             $1 == i {
-                $2=t
-                found=1
+                if (!found) {
+                    print i, t
+                    found=1
+                }
+                next
             }
-            {
-                print
+
+            NF >= 2 {
+                print $1, $2
             }
+
             END {
                 if (!found)
-                    print i,t
+                    print i, t
             }
         ' "$WD_STATE" > "$TMP"
     else
@@ -115,8 +123,6 @@ set_last_repair()
 
     mv "$TMP" "$WD_STATE"
 }
-
-
 ndms_uptime()
 {
     ndms="$1"
@@ -151,41 +157,66 @@ latest_handshake()
 
 acquire_repair_lock()
 {
-    my_pid="$(sh -c 'echo $PPID' 2>/dev/null || echo $$)"
+    my_pid="$$"
 
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-        printf "%s\n" "$my_pid" > "$LOCK_DIR/pid"
+        printf '%s\n' "$my_pid" > "$LOCK_DIR/pid"
         return 0
     fi
 
-    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    #
+    # A lock directory may exist while its owner is still
+    # writing the PID. Never steal it immediately.
+    #
+    n=0
 
-    case "$pid" in
-        ""|*[!0-9]*)
-            rm -rf "$LOCK_DIR"
-            ;;
-        *)
-            if ! kill -0 "$pid" 2>/dev/null; then
-                rm -rf "$LOCK_DIR"
-            else
-                return 1
-            fi
-            ;;
-    esac
+    while [ "$n" -lt 5 ]; do
+
+        pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+
+        case "$pid" in
+            ''|*[!0-9]*)
+                sleep 1
+                n=$((n + 1))
+                continue
+                ;;
+        esac
+
+        #
+        # Owner is alive: another recovery is running.
+        #
+        if kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+
+        #
+        # Owner is dead: stale lock.
+        #
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        break
+    done
 
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-        printf "%s\n" "$my_pid" > "$LOCK_DIR/pid"
+        printf '%s\n' "$my_pid" > "$LOCK_DIR/pid"
         return 0
     fi
 
     return 1
 }
 
+
 release_repair_lock()
 {
+    my_pid="$$"
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+
+    #
+    # Never remove a lock belonging to another process.
+    #
+    [ "$pid" = "$my_pid" ] || return 0
+
     rm -rf "$LOCK_DIR"
 }
-
 repair_one()
 {
     source="$1"
@@ -350,6 +381,27 @@ check_all()
 }
 
 
+run_watchdog()
+{
+    QUIET=1
+    export QUIET
+
+    trap 'release_repair_lock; rm -f "$PIDFILE"; exit 0' TERM INT
+
+    wd_log "started"
+    wd_log "pid: $$"
+    wd_log "check interval: ${CHECK_INTERVAL}s"
+    wd_log "handshake threshold: ${HANDSHAKE_MAX_AGE}s"
+    wd_log "interface grace: ${INTERFACE_GRACE}s"
+    wd_log "repair cooldown: ${REPAIR_COOLDOWN}s"
+
+    while :; do
+        check_all
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+
 start()
 {
     if is_running; then
@@ -359,25 +411,15 @@ start()
 
     rm -f "$PIDFILE"
 
-    (
-        QUIET=1
-        export QUIET
+    #
+    # Start a separate shell process.
+    # In __run mode $$ is the real watchdog PID.
+    #
+    "$SELF" __run &
 
-        trap 'exit 0' TERM INT
+    child_pid="$!"
 
-        wd_log "started"
-        wd_log "check interval: ${CHECK_INTERVAL}s"
-        wd_log "handshake threshold: ${HANDSHAKE_MAX_AGE}s"
-        wd_log "repair cooldown: ${REPAIR_COOLDOWN}s"
-
-        while :; do
-            check_all
-            sleep "$CHECK_INTERVAL"
-        done
-
-    ) &
-
-    echo $! > "$PIDFILE"
+    echo "$child_pid" > "$PIDFILE"
 
     sleep 1
 
@@ -390,8 +432,6 @@ start()
     echo "ERROR: watchdog failed to start"
     return 1
 }
-
-
 stop()
 {
     if ! is_running; then
@@ -429,6 +469,10 @@ status()
 
 
 case "${1:-start}" in
+
+    __run)
+        run_watchdog
+        ;;
 
     start)
         start
